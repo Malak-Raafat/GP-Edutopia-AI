@@ -21,42 +21,58 @@ llm = ChatGroq(
     temperature=0.7
 )
 
-# Initialize embeddings and load documents
+# Initialize embeddings
 embeddings = HuggingFaceEmbeddings()
+
+def load_context(file_path: str) -> tuple:
+    try:
+        print(f"\nLoading context from: {file_path}")
+        
+        # Load and process documents
+        with open(file_path, "r", encoding="utf-8") as file:
+            content = file.read()
+        
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        final_documents = text_splitter.create_documents([content])
+        
+        print(f"Created {len(final_documents)} document chunks")
+        
+        # Initialize Chroma DB
+        vectors = Chroma.from_documents(final_documents, embeddings)
+        
+        # Create RAG chain
+        rag_prompt = ChatPromptTemplate.from_template(
+            """
+            You are a helpful assistant. Answer the question **ONLY** using the provided context. 
+            If the context does not contain relevant information, respond with:  
+            "I don't know based on the provided context."  
+              
+            Context:  
+            {context}  
+            
+            Question: {input}  
+            """
+        )
+        
+        document_chain = create_stuff_documents_chain(llm, rag_prompt)
+        retriever = vectors.as_retriever()
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
+        
+        print("Context loaded and processed successfully!")
+        return vectors, retrieval_chain
+        
+    except Exception as e:
+        print(f"Error loading context: {str(e)}")
+        raise
+
+# Load initial context
 file_path = "/Users/habibaalaa/Downloads/Simple Agent/quantum.txt"
-
-# Load and process documents
-with open(file_path, "r", encoding="utf-8") as file:
-    content = file.read()
-
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-final_documents = text_splitter.create_documents([content])
-
-# Initialize Chroma DB
-vectors = Chroma.from_documents(final_documents, embeddings)
-
-# Create RAG chain
-rag_prompt = ChatPromptTemplate.from_template(
-    """
-    You are a helpful assistant. Answer the question **ONLY** using the provided context. 
-    If the context does not contain relevant information, respond with:  
-    "I don't know based on the provided context."  
-      
-    Context:  
-    {context}  
-    
-    Question: {input}  
-    """
-)
-
-document_chain = create_stuff_documents_chain(llm, rag_prompt)
-retriever = vectors.as_retriever()
-retrieval_chain = create_retrieval_chain(retriever, document_chain)
+vectors, retrieval_chain = load_context(file_path)
 
 # Define the state
 class AgentState(TypedDict):
     input: str
-    chat_history: Sequence[str]
     current_step: str
     final_answer: str
     questions: str
@@ -102,12 +118,7 @@ class RAGTool(BaseTool):
                 )
                 final_prompt = prompt.format(query=input)
                 llm_response = llm.invoke(final_prompt)
-                return (
-                    "RAG System Response: I don't know based on the provided context.\n\n"
-                    "Falling back to built-in knowledge:\n"
-                    "----------------------------------------\n"
-                    f"{llm_response.content}"
-                )
+                return llm_response.content
             
             return rag_answer
             
@@ -401,7 +412,6 @@ def process_query(query: str):
         # Initialize the state
         initial_state = {
             "input": query,
-            "chat_history": [],
             "current_step": "start",
             "final_answer": "",
             "questions": "",
