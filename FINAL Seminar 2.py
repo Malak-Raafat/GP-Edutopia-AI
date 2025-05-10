@@ -9,10 +9,14 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain_community.vectorstores import Chroma
+from langchain.memory import ConversationSummaryBufferMemory
 import os
 import json
 
-GROQ_API_KEY = "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"
+# Suppress HuggingFace tokenizers warnings
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+GROQ_API_KEY = "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"
 
 # Initialize LLM
 llm = ChatGroq(
@@ -67,10 +71,10 @@ def load_context(file_path: str) -> tuple:
         raise
 
 # Load initial context
-file_path = "/Users/habibaalaa/Downloads/Simple Agent/quantum.txt"
+file_path = "/Users/habibaalaa/Downloads/🎓🫣/Simple Agent/text.txt"
 vectors, retrieval_chain = load_context(file_path)
 
-# Define the state
+# Define the state with memory
 class AgentState(TypedDict):
     input: str
     current_step: str
@@ -78,11 +82,24 @@ class AgentState(TypedDict):
     questions: str
     tool_used: str
     thoughts: str
+    memory: ConversationSummaryBufferMemory
+
+# Initialize memory
+memory = ConversationSummaryBufferMemory(
+    llm=llm,
+    max_token_limit=2000,
+    return_messages=True
+)
 
 # Define the RAG Tool
 class RAGTool(BaseTool):
     name: str = "RAG Tool"
     description: str = "Use this tool to retrieve information from the knowledge base or generate an answer using built-in knowledge."
+    memory: ConversationSummaryBufferMemory = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.memory = None
 
     def _run(self, input: str) -> str:
         try:
@@ -100,23 +117,33 @@ class RAGTool(BaseTool):
             response = retrieval_chain.invoke({"input": input})
             rag_answer = response['answer']
             
-            # If RAG doesn't know, fall back to LLM
+            # If RAG doesn't know, fall back to LLM silently
             if "I don't know based on the provided context" in rag_answer:
-                print("No relevant information in RAG. Falling back to LLM knowledge...")
-                # Create a prompt for the LLM to answer using its knowledge
+                # Get conversation history from memory if available
+                conversation_history = []
+                if self.memory:
+                    memory_variables = self.memory.load_memory_variables({})
+                    conversation_history = memory_variables.get("history", [])
+                
+                # Create a prompt for the LLM that includes conversation history
                 prompt = PromptTemplate(
-                    input_variables=["query"],
+                    input_variables=["conversation_history", "query"],
                     template=(
-                        "You are a knowledgeable assistant. Please provide a detailed and accurate answer to this query:\n\n"
-                        "{query}\n\n"
+                        "Previous conversation:\n{conversation_history}\n\n"
+                        "Current question: {query}\n\n"
+                        "Please provide a brief and concise answer that takes into account the previous conversation. "
                         "Requirements:\n"
-                        "1. Provide accurate information\n"
-                        "2. Include technical details where relevant\n"
-                        "3. Structure the response in clear paragraphs\n"
-                        "4. Focus on providing factual information"
+                        "1. Keep the answer short and to the point\n"
+                        "2. Focus on the most important information\n"
+                        "3. Use bullet points if appropriate\n"
+                        "4. Maximum 3-4 sentences\n"
+                        "5. Reference previous conversation when relevant"
                     )
                 )
-                final_prompt = prompt.format(query=input)
+                final_prompt = prompt.format(
+                    conversation_history="\n".join([f"{msg.type}: {msg.content}" for msg in conversation_history]) if conversation_history else "No previous conversation",
+                    query=input
+                )
                 llm_response = llm.invoke(final_prompt)
                 return llm_response.content
             
@@ -134,17 +161,10 @@ class RAGTool(BaseTool):
 class QuestionGenerator(BaseTool):
     name: str = "Question Generator"
     description: str = (
-        "Generates structured questions based on the original user-provided text and question requirements. "
+        "Generates 5 structured questions based on the original user-provided text and question requirements. "
         "When using this tool, the action input must be in the following format: \n\n"
         "    <original_text> ### <question_requirements>\n\n"
-        "For example, if the user provides a detailed educational text and specific requirements, "
-        "the input should include the full original text, followed by '###', followed by the requirements. \n\n"
-        "This tool will then generate:\n"
-        "- 5 Y/N questions (each including an answer),\n"
-        "- 5 True/False questions (without answers),\n"
-        "- 5 WH questions (without answers), and\n"
-        "- 5 MCQs (each with 4 options and the correct answer).\n\n"
-        "DO NOT use any summarized or modified version of the input. Use the original text exactly as provided."
+        "The tool can generate different types of questions (MCQ, Y/N, T/F, WH) based on the requirements."
     )
 
     def _run(self, input: str) -> str:
@@ -155,75 +175,70 @@ class QuestionGenerator(BaseTool):
                 print(f"Split input into text and request")
             else:
                 paragraph_text = input
-                user_request = ("Generate 5 y/n questions with answers and 5 t/f without answers "
-                                "and 5 wh questions without answers and 5 mcq with answers")
+                user_request = "Generate 5 questions about the topic"
                 print("Using default question request")
             
-            print("Creating prompt template...")
-            prompt = PromptTemplate(
-                input_variables=["paragraph_text", "user_request"],
-                template=(
-                    "You are a question generator that creates structured questions based on educational text.\n\n"
-                    "Based on this text:\n\n"
-                    "{paragraph_text}\n\n"
-                    "Generate questions as per this request:\n"
-                    "{user_request}\n\n"
-                    "IMPORTANT: Return ONLY a valid JSON object with this EXACT structure:\n"
-                    "{{\n"
-                    '  "yes_no": [\n'
-                    '    {{"question": "Is pasta originally from Sicily?", "answer": "Yes"}},\n'
-                    '    // 4 more yes/no questions\n'
-                    "  ],\n"
-                    '  "true_false": [\n'
-                    '    {{"question": "Pasta was first recorded in the 15th century."}},\n'
-                    '    // 4 more true/false questions\n'
-                    "  ],\n"
-                    '  "wh_questions": [\n'
-                    '    {{"question": "When was pasta first recorded in Sicily?"}},\n'
-                    '    // 4 more wh questions\n'
-                    "  ],\n"
-                    '  "mcq": [\n'
-                    '    {{"question": "What is the origin of the word pasta?",\n'
-                    '      "options": [\n'
-                    '        "A) From Greek pastros",\n'
-                    '        "B) From Italian for dough",\n'
-                    '        "C) From Latin pasta",\n'
-                    '        "D) From Arabic pastah"\n'
-                    '      ],\n'
-                    '      "answer": "B) From Italian for dough"}},\n'
-                    '    // 4 more mcq questions\n'
-                    "  ]\n"
-                    "}}\n\n"
-                    "REQUIREMENTS:\n"
-                    "1. Return ONLY the JSON object, no other text\n"
-                    "2. Ensure all JSON keys and values are in double quotes\n"
-                    "3. Generate EXACTLY 5 questions of each type\n"
-                    "4. Follow the example format exactly\n"
-                    "5. Base all questions on the provided text only\n"
+            # Determine question type from user request
+            question_type = "mcq"  # default
+            if "mcq" in user_request.lower():
+                question_type = "mcq"
+            elif "y/n" in user_request.lower() or "yes/no" in user_request.lower():
+                question_type = "yes_no"
+            elif "t/f" in user_request.lower() or "true/false" in user_request.lower():
+                question_type = "true_false"
+            elif "wh" in user_request.lower():
+                question_type = "wh"
+            
+            print(f"Generating {question_type} questions...")
+            
+            # Create appropriate template based on question type
+            if question_type == "mcq":
+                template = (
+                    "Generate 5 multiple choice questions about the following text. Each question should have 4 options (A, B, C, D) and one correct answer.\n\n"
+                    "Text: {text}\n\n"
+                    "Requirements:\n"
+                    "1. Questions must be directly related to the text\n"
+                    "2. Each question must have exactly 4 options\n"
+                    "3. Mark the correct answer\n"
+                    "4. Make questions challenging but fair\n"
+                    "5. Cover different aspects of the topic\n\n"
+                    "Format each question as:\n"
+                    "1. [Question text]\n"
+                    "   A) [Option A]\n"
+                    "   B) [Option B]\n"
+                    "   C) [Option C]\n"
+                    "   D) [Option D]\n"
+                    "   Answer: [Correct option]\n\n"
                 )
+            else:
+                template = (
+                    "Generate 5 {question_type} questions about the following text.\n\n"
+                    "Text: {text}\n\n"
+                    "Requirements:\n"
+                    "1. Questions must be directly related to the text\n"
+                    "2. Make questions challenging but fair\n"
+                    "3. Cover different aspects of the topic\n"
+                    "4. Include the answer for each question\n\n"
+                    "Format each question as:\n"
+                    "1. [Question text]\n"
+                    "   Answer: [Answer]\n\n"
+                )
+            
+            prompt = PromptTemplate(
+                input_variables=["text", "question_type"],
+                template=template
             )
 
             print("Formatting prompt...")
-            final_prompt = prompt.format(paragraph_text=paragraph_text.strip(), user_request=user_request.strip())
+            final_prompt = prompt.format(
+                text=paragraph_text.strip(),
+                question_type=question_type
+            )
             print("Sending prompt to LLM...")
             response = llm.invoke(final_prompt)
             print("Received response from LLM")
             
-            # Validate JSON
-            try:
-                json.loads(response.content)
-                return response.content
-            except json.JSONDecodeError:
-                print("Invalid JSON received. Attempting to fix...")
-                # Try to extract JSON from the response if it contains other text
-                import re
-                json_match = re.search(r'({[\s\S]*})', response.content)
-                if json_match:
-                    json_str = json_match.group(1)
-                    # Validate the extracted JSON
-                    json.loads(json_str)
-                    return json_str
-                raise ValueError("Could not extract valid JSON from response")
+            return response.content
                 
         except Exception as e:
             error_msg = f"Error in question generation: {str(e)}"
@@ -310,9 +325,76 @@ def generate_questions(state: AgentState) -> AgentState:
             base_text = rag_response
         
         state["thoughts"] += "\n\nUsing Question Generator tool to create structured questions..."
-        questions = question_tool.run(f"{base_text} ### Generate 5 questions about {topic}")
+        
+        # Determine question type from the query
+        question_type = "mcq"  # default
+        if "y/n" in query.lower() or "yes/no" in query.lower():
+            question_type = "yes_no"
+        elif "t/f" in query.lower() or "true/false" in query.lower():
+            question_type = "true_false"
+        elif "wh" in query.lower():
+            question_type = "wh"
+        
+        # Create appropriate template based on question type
+        if question_type == "yes_no":
+            template = (
+                "Generate 5 yes/no questions about the following text. Each question should be answerable with yes or no.\n\n"
+                "Text: {text}\n\n"
+                "Requirements:\n"
+                "1. Questions must be directly related to the text content\n"
+                "2. Each question must be answerable with yes or no\n"
+                "3. Include the correct answer (Yes/No) for each question\n"
+                "4. Make questions challenging but fair\n"
+                "5. Cover different aspects of the topic\n\n"
+                "Format each question as:\n"
+                "1. [Question text]\n"
+                "   Answer: [Yes/No]\n\n"
+            )
+        elif question_type == "mcq":
+            template = (
+                "Generate 5 multiple choice questions about the following text. Each question should have 4 options (A, B, C, D) and one correct answer.\n\n"
+                "Text: {text}\n\n"
+                "Requirements:\n"
+                "1. Questions must be directly related to the text\n"
+                "2. Each question must have exactly 4 options\n"
+                "3. Mark the correct answer\n"
+                "4. Make questions challenging but fair\n"
+                "5. Cover different aspects of the topic\n\n"
+                "Format each question as:\n"
+                "1. [Question text]\n"
+                "   A) [Option A]\n"
+                "   B) [Option B]\n"
+                "   C) [Option C]\n"
+                "   D) [Option D]\n"
+                "   Answer: [Correct option]\n\n"
+            )
+        else:
+            template = (
+                "Generate 5 {question_type} questions about the following text.\n\n"
+                "Text: {text}\n\n"
+                "Requirements:\n"
+                "1. Questions must be directly related to the text\n"
+                "2. Make questions challenging but fair\n"
+                "3. Cover different aspects of the topic\n"
+                "4. Include the answer for each question\n\n"
+                "Format each question as:\n"
+                "1. [Question text]\n"
+                "   Answer: [Answer]\n\n"
+            )
+        
+        prompt = PromptTemplate(
+            input_variables=["text", "question_type"],
+            template=template
+        )
+
+        final_prompt = prompt.format(
+            text=base_text.strip(),
+            question_type=question_type
+        )
+        
+        questions = llm.invoke(final_prompt)
         state["thoughts"] += "\n\nQuestions generated successfully. Moving to formatting step..."
-        state["questions"] = questions
+        state["questions"] = questions.content
         state["current_step"] = "questions_generated"
         state["tool_used"] = "questions"
         return state
@@ -328,34 +410,8 @@ def format_final_answer(state: AgentState) -> AgentState:
     if state["tool_used"] == "questions":
         try:
             state["thoughts"] += "\n\nFormatting the generated questions into a readable structure..."
-            questions_data = json.loads(state["questions"])
-            formatted_questions = "Here are the generated questions:\n\n"
-            
-            # Format Yes/No questions
-            formatted_questions += "Yes/No Questions:\n"
-            for q in questions_data.get("yes_no", []):
-                formatted_questions += f"- {q['question']} (Answer: {q['answer']})\n"
-            
-            # Format True/False questions
-            formatted_questions += "\nTrue/False Questions:\n"
-            for q in questions_data.get("true_false", []):
-                formatted_questions += f"- {q['question']}\n"
-            
-            # Format WH questions
-            formatted_questions += "\nWH Questions:\n"
-            for q in questions_data.get("wh_questions", []):
-                formatted_questions += f"- {q['question']}\n"
-            
-            # Format MCQs
-            formatted_questions += "\nMultiple Choice Questions:\n"
-            for q in questions_data.get("mcq", []):
-                formatted_questions += f"- {q['question']}\n"
-                for option in q["options"]:
-                    formatted_questions += f"  {option}\n"
-                formatted_questions += f"  Answer: {q['answer']}\n"
-            
-            state["thoughts"] += "\n\nQuestions formatted successfully. Preparing final output..."
-            state["final_answer"] = formatted_questions
+            # The questions are already formatted by the QuestionGenerator
+            state["final_answer"] = state["questions"]
             state["current_step"] = "completed"
             return state
         except Exception as e:
@@ -403,11 +459,19 @@ workflow.set_entry_point("plan")
 # Compile the graph
 app = workflow.compile()
 
-def process_query(query: str):
+def process_query(query: str, memory: ConversationSummaryBufferMemory = None):
     """Process a user query and return the response"""
     try:
         print(f"\nProcessing query: '{query}'")
         print("Initializing agent state...")
+        
+        # Initialize memory if not provided
+        if memory is None:
+            memory = ConversationSummaryBufferMemory(
+                llm=llm,
+                max_token_limit=2000,
+                return_messages=True
+            )
         
         # Initialize the state
         initial_state = {
@@ -416,12 +480,22 @@ def process_query(query: str):
             "final_answer": "",
             "questions": "",
             "tool_used": "",
-            "thoughts": "Starting to process the query..."
+            "thoughts": "Starting to process the query...",
+            "memory": memory
         }
+        
+        # Set memory in RAG tool
+        rag_tool.memory = memory
         
         print("Running workflow...")
         # Run the workflow
         final_state = app.invoke(initial_state)
+        
+        # Save to memory
+        final_state["memory"].save_context(
+            {"input": query},
+            {"output": final_state["final_answer"]}
+        )
         
         print("Workflow completed successfully!")
         
@@ -435,30 +509,39 @@ def process_query(query: str):
 try:
     print("\nStarting agent execution...")
     
-    # Test with a question generation query
-    query = "generate 5 questions about the history of game design"  # Simplified query
-    print("\nTesting question generation:")
-    response = process_query(query)
-    if response:
-        print("\nAgent's Process:")
-        print("-" * 50)
-        print(response)
-        print("-" * 50)
-    else:
-        print("No response received due to error")
-
-    # Test with a RAG query
-    query = "explain for me the rules of chess"
-    print("\nTesting RAG query:")
-    response = process_query(query)
-    if response:
-        print("\nAgent's Process:")
-        print("-" * 50)
-        print(response)
-        print("-" * 50)
-    else:
-        print("No response received due to error")
-        
+    # Initialize memory for the conversation
+    conversation_memory = ConversationSummaryBufferMemory(
+        llm=llm,
+        max_token_limit=2000,
+        return_messages=True
+    )
+    
+    # Test conversation with memory and question generation
+    print("\nTesting conversation with memory and question generation:")
+    queries = [
+        "what is seaborn? give me a short answer",
+        "how to make bar plot? keep it brief",
+        "how to change colors? short answer please",
+        "generate 5 t/f questions about it "
+    ]
+    
+    for i, query in enumerate(queries, 1):
+        print(f"\nQuery {i}: {query}")
+        response = process_query(query, conversation_memory)
+        if response:
+            print("\nAgent's Process:")
+            print("-" * 50)
+            print(response)
+            print("-" * 50)
+            
+            # Print memory summary
+            print("\nConversation Summary:")
+            print("-" * 50)
+            print(conversation_memory.load_memory_variables({})["history"])
+            print("-" * 50)
+        else:
+            print("No response received due to error")
+    
     print("\nAll tests completed successfully!")
 except Exception as e:
     print(f"\nMain execution error: {str(e)}")
