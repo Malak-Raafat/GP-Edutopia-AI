@@ -3,7 +3,7 @@ from langchain.tools import BaseTool
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
-from typing import Dict, TypedDict, Annotated, Sequence
+from typing import Dict, TypedDict, Annotated, Sequence, List, Any
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -12,6 +12,8 @@ from langchain_community.vectorstores import Chroma
 from langchain.memory import ConversationSummaryBufferMemory
 import os
 import json
+import sqlite3
+from datetime import datetime
 
 # Suppress HuggingFace tokenizers warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -28,7 +30,46 @@ llm = ChatGroq(
 # Initialize embeddings
 embeddings = HuggingFaceEmbeddings()
 
-def load_context(file_path: str) -> tuple:
+def parse_conversation_data(user_str: str, ai_str: str) -> ConversationSummaryBufferMemory:
+    try:
+        # Initialize memory
+        memory = ConversationSummaryBufferMemory(
+            llm=llm,
+            max_token_limit=2000,
+            return_messages=True
+        )
+        
+        # Split the strings into lists
+        user_messages = [msg.strip() for msg in user_str.split(',')]
+        ai_messages = [msg.strip() for msg in ai_str.split(',')]
+        
+        # Ensure both lists have the same length
+        if len(user_messages) != len(ai_messages):
+            print("Warning: Number of user messages does not match number of AI messages")
+            min_length = min(len(user_messages), len(ai_messages))
+            user_messages = user_messages[:min_length]
+            ai_messages = ai_messages[:min_length]
+        
+        # Save each conversation pair to memory
+        for user_msg, ai_msg in zip(user_messages, ai_messages):
+            if user_msg and ai_msg:  # Only save non-empty messages
+                memory.save_context(
+                    {"input": user_msg},
+                    {"output": ai_msg}
+                )
+        
+        return memory
+        
+    except Exception as e:
+        print(f"Error parsing conversation data: {str(e)}")
+        # Return fresh memory if parsing fails
+        return ConversationSummaryBufferMemory(
+            llm=llm,
+            max_token_limit=2000,
+            return_messages=True
+        )
+
+def load_context(file_path: str, user_str: str = None, ai_str: str = None) -> tuple:
     try:
         print(f"\nLoading context from: {file_path}")
         
@@ -64,15 +105,28 @@ def load_context(file_path: str) -> tuple:
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
         
         print("Context loaded and processed successfully!")
-        return vectors, retrieval_chain
+        
+        # Initialize memory with conversation history if provided
+        if user_str and ai_str:
+            print("Loading conversation history into memory...")
+            memory = parse_conversation_data(user_str, ai_str)
+        else:
+            print("Initializing fresh memory...")
+            memory = ConversationSummaryBufferMemory(
+                llm=llm,
+                max_token_limit=2000,
+                return_messages=True
+            )
+        
+        return vectors, retrieval_chain, memory
         
     except Exception as e:
         print(f"Error loading context: {str(e)}")
         raise
 
-# Load initial context
+# Load initial context and memory
 file_path = "/Users/habibaalaa/Downloads/🎓🫣/Simple Agent/text.txt"
-vectors, retrieval_chain = load_context(file_path)
+vectors, retrieval_chain, memory = load_context(file_path)
 
 # Define the state with memory
 class AgentState(TypedDict):
@@ -83,13 +137,6 @@ class AgentState(TypedDict):
     tool_used: str
     thoughts: str
     memory: ConversationSummaryBufferMemory
-
-# Initialize memory
-memory = ConversationSummaryBufferMemory(
-    llm=llm,
-    max_token_limit=2000,
-    return_messages=True
-)
 
 # Define the RAG Tool
 class RAGTool(BaseTool):
@@ -424,21 +471,13 @@ workflow.set_entry_point("plan")
 # Compile the graph
 app = workflow.compile()
 
-def process_query(query: str, memory: ConversationSummaryBufferMemory = None):
+def process_query(query: str):
     """Process a user query and return the response"""
     try:
         print(f"\nProcessing query: '{query}'")
         print("Initializing agent state...")
         
-        # Initialize memory if not provided
-        if memory is None:
-            memory = ConversationSummaryBufferMemory(
-                llm=llm,
-                max_token_limit=2000,
-                return_messages=True
-            )
-        
-        # Initialize the state
+        # Initialize the state with existing memory
         initial_state = {
             "input": query,
             "current_step": "start",
@@ -474,38 +513,102 @@ def process_query(query: str, memory: ConversationSummaryBufferMemory = None):
 try:
     print("\nStarting agent execution...")
     
-    # Initialize memory for the conversation
-    conversation_memory = ConversationSummaryBufferMemory(
-        llm=llm,
-        max_token_limit=2000,
-        return_messages=True
-    )
+    # Test Case 1: Creating new memory
+    print("\n=== Test Case 1: Creating New Memory ===")
+    print("Initializing a new conversation...")
     
-    # Test conversation with memory and question generation
-    print("\nTesting conversation with memory and question generation:")
-    queries = [
+    # Test conversation with new memory
+    initial_queries = [
         "what is seaborn? give me a short answer",
         "how to make bar plot? keep it brief",
-        "how to change colors? short answer please",
-        "generate 5 mcq questions about it "
+        "how to change colors? short answer please"
     ]
     
-    for i, query in enumerate(queries, 1):
+    # Initialize conversation strings
+    user_str = ""
+    ai_str = ""
+    
+    print("\nProcessing initial queries to create memory:")
+    for i, query in enumerate(initial_queries, 1):
         print(f"\nQuery {i}: {query}")
-        response = process_query(query, conversation_memory)
+        response = process_query(query)
         if response:
             print("\nAgent's Process:")
             print("-" * 50)
             print(response)
             print("-" * 50)
             
-            # Print memory summary
-            print("\nConversation Summary:")
+            # Update conversation strings with the new interaction
+            user_str += query + ","
+            ai_str += response.split("Final Answer:\n")[1].strip() + ","
+            
+            # Print current memory state
+            print("\nCurrent Memory State:")
             print("-" * 50)
-            print(conversation_memory.load_memory_variables({})["history"])
+            print(memory.chat_memory.messages)
             print("-" * 50)
         else:
             print("No response received due to error")
+    
+    # Test Case 2: Loading existing memory and adding new conversations
+    print("\n=== Test Case 2: Loading Existing Memory and Adding New Conversations ===")
+    print("Loading previous conversation data...")
+    
+    # Reload context with conversation history
+    vectors, retrieval_chain, memory = load_context(file_path, user_str, ai_str)
+    
+    # Test conversation with loaded memory
+    follow_up_queries = [
+        "can you explain more about bar plots?",
+        "generate 5 y/n questions about seaborn"
+    ]
+    
+    print("\nProcessing follow-up queries with loaded memory:")
+    for i, query in enumerate(follow_up_queries, 1):
+        print(f"\nQuery {i}: {query}")
+        response = process_query(query)
+        if response:
+            print("\nAgent's Process:")
+            print("-" * 50)
+            print(response)
+            print("-" * 50)
+            
+            # Update conversation strings with the new interaction
+            user_str += query + ","
+            ai_str += response.split("Final Answer:\n")[1].strip() + ","
+            
+            # Print current memory state
+            print("\nCurrent Memory State:")
+            print("-" * 50)
+            print(memory.chat_memory.messages)
+            print("-" * 50)
+        else:
+            print("No response received due to error")
+    
+    # Test Case 3: Verify memory persistence
+    print("\n=== Test Case 3: Verifying Memory Persistence ===")
+    print("Testing memory with a new query that references previous conversations...")
+    
+    # Reload context with updated conversation history
+    vectors, retrieval_chain, memory = load_context(file_path, user_str, ai_str)
+    
+    final_query = "based on our previous discussion, what's the best way to customize a seaborn plot?"
+    print(f"\nFinal Query: {final_query}")
+    response = process_query(final_query)
+    
+    if response:
+        print("\nAgent's Process:")
+        print("-" * 50)
+        print(response)
+        print("-" * 50)
+        
+        # Print final memory state
+        print("\nFinal Memory State:")
+        print("-" * 50)
+        print(memory.chat_memory.messages)
+        print("-" * 50)
+    else:
+        print("No response received due to error")
     
     print("\nAll tests completed successfully!")
 except Exception as e:
