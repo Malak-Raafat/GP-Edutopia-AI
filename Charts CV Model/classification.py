@@ -27,7 +27,7 @@ def load_model(model_path, num_classes):
 
 # Define image transformations
 transform = transforms.Compose([
-    transforms.Resize((300, 300)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
